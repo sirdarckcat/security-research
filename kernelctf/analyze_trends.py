@@ -708,6 +708,12 @@ def main():
 
     print(report)
 
+    # Write report.md next to this script so it is committed to the repo.
+    report_path = os.path.join(base_dir, "report.md")
+    with open(report_path, "w") as f:
+        f.write(report + "\n")
+    print(f"[-] Report written to {report_path}", file=sys.stderr)
+
     step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if step_summary:
         with open(step_summary, "a") as f:

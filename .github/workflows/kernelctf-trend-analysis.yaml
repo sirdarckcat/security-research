@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   issues: write
 
 jobs:
@@ -22,10 +22,17 @@ jobs:
         id: analysis
         run: |
           set +e
-          python3 kernelctf/analyze_trends.py > /tmp/trend_report.md 2>/tmp/analysis_stderr.txt
+          python3 kernelctf/analyze_trends.py 2>/tmp/analysis_stderr.txt
           echo "exit_code=$?" >> "$GITHUB_OUTPUT"
           cat /tmp/analysis_stderr.txt >&2
-          cat /tmp/trend_report.md >> "$GITHUB_STEP_SUMMARY"
+          cat kernelctf/report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit updated report.md
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add kernelctf/report.md
+          git diff --staged --quiet || git commit -m "chore: update kernelctf/report.md [skip ci]" && git push
 
       - name: Notify product teams (create or update tracking issue)
         if: steps.analysis.outputs.exit_code == '1'
@@ -49,7 +56,7 @@ jobs:
             --jq '.[0].number' \
             --repo "$GITHUB_REPOSITORY")
 
-          BODY=$(cat /tmp/trend_report.md)
+          BODY=$(cat kernelctf/report.md)
 
           if [ -n "$EXISTING" ]; then
             # Update the body of the existing issue with the latest report.
