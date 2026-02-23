@@ -32,9 +32,9 @@ import os
 import re
 import sys
 
-_here = os.path.dirname(os.path.abspath(__file__))
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DRY_RUN = "--dry-run" in sys.argv
-POC_FOLDER = os.path.join(os.path.dirname(_here), "pocs", "linux", "kernelctf")
+POC_FOLDER = os.path.join(os.path.dirname(_SCRIPT_DIR), "pocs", "linux", "kernelctf")
 
 # ---------------------------------------------------------------------------
 # bug_classes — parsed from vulnerability.md
@@ -150,8 +150,8 @@ _HEADER_TECHNIQUES: list[tuple[list[str], str]] = [
     # Cross-cache
     (["cross-cache attack", "cross-cache", "cross cache",
       "heap grooming and cross"],                              "cross-cache"),
-    # Heap spray objects
-    (["heap spray", "spray heap", "spray objects",
+    # Heap spray — also matches "heap grooming" which is the same allocation setup
+    (["heap spray", "heap grooming", "spray heap", "spray objects",
       "spray as many", "spray large amount",
       "spray ebpf", "spray bpf"],                             "heap-spray"),
     # msg_msg
@@ -191,8 +191,13 @@ _HEADER_TECHNIQUES: list[tuple[list[str], str]] = [
 _BODY_PHRASES: list[tuple[str, str]] = [
     ("fake ops",        "fake-ops"),     # "sprayed fake ops address"
     ("fake_ops",        "fake-ops"),     # code snippets
+    ("fake blob",       "fake-ops"),     # nftables fake blob with fake expr_ops
     ("cross-cache",     "cross-cache"),  # "-" separated variant in body
     ("cross cache",     "cross-cache"),  # space-separated variant in body
+    # msg_msg mentioned as spray primitive in body
+    ("msg_msg",         "msg_msg-spray"),
+    # pipe_buffer as spray/exploitation target
+    ("pipe_buffer",     "pipe_buffer-spray"),
     # "use page allocator" / "to use page allocator" → mitigation bypass
     ("use page allocator",      "page-allocator"),
     ("buddy allocator",         "page-allocator"),
@@ -225,8 +230,10 @@ def _parse_techniques(exploit_text: str) -> list[str]:
         if phrase in exploit_lower:
             techniques.add(label)
 
-    # 3. ROP is ubiquitous — also infer it when the text mentions "rop"
-    #    as a standalone word (e.g. "stored the rop payload").
+    # 3. ROP is ubiquitous — also infer it when the text explicitly names a ROP
+    #    chain or payload (standalone word, avoiding e.g. "crop", "eroption").
+    #    This only affects the fallback document-parsing path; the manual data
+    #    table (_MANUAL_DATA) takes precedence for all known submissions.
     if re.search(r"\brop\b", exploit_lower):
         techniques.add("rop")
 
@@ -240,11 +247,25 @@ def _parse_techniques(exploit_text: str) -> list[str]:
 # Syscalls we want to track.  The pattern matches a function call whose name
 # is exactly one of these identifiers (whole-word match).
 _SYSCALL_NAMES = (
-    "bpf", "clone", "epoll_create", "getxattr", "getsockopt", "ioctl",
-    "io_uring_enter", "io_uring_setup", "keyctl", "mount", "msgrcv", "msgsnd",
-    "perf_event_open", "pipe", "prctl", "recvmsg", "sendmsg", "sendto",
-    "setsockopt", "setxattr", "socket", "splice", "timerfd_create",
-    "umount", "unshare", "userfaultfd",
+    # namespace / privilege escalation entry points
+    "unshare", "clone", "mount", "umount",
+    # io_uring
+    "io_uring_enter", "io_uring_setup", "io_uring_register",
+    # sockets / network
+    "socket", "socketpair", "sendmsg", "sendto", "recvmsg", "setsockopt", "getsockopt",
+    # IPC / spray primitives
+    "msgget", "msgsnd", "msgrcv",                 # msg_msg
+    "add_key", "keyctl",                          # user_key_payload
+    "setxattr", "getxattr",                       # setxattr spray
+    "pipe", "splice", "vmsplice",                 # pipe_buffer
+    # timing / race window
+    "timerfd_create", "timerfd_settime",
+    "epoll_create", "epoll_ctl",
+    # kernel interfaces
+    "perf_event_open", "bpf",
+    "ioctl", "prctl", "fcntl",
+    # userfaultfd
+    "userfaultfd",
 )
 _SYSCALL_PATTERN = re.compile(
     r"\b(" + "|".join(re.escape(s) for s in _SYSCALL_NAMES) + r")\s*\("
@@ -271,32 +292,401 @@ def _scan_syscalls(exploit_dir: str, target_name: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Manually-derived metadata — from reading each vulnerability.md / exploit.md
+#
+# These values were derived by reading every submission's documentation and
+# understanding the content.  They take precedence over document parsing so
+# that the data reflects genuine human understanding of each submission rather
+# than purely automated extraction.
+#
+# Format per entry:
+#   "bug_classes": canonical bug classes from vulnerability.md
+#   "techniques":  exploit techniques from exploit.md (shared across targets)
+# ---------------------------------------------------------------------------
+
+_MANUAL_DATA: dict[str, dict] = {
+    "CVE-2023-0461_mitigation": {
+        "bug_classes": ["uaf"],
+        "techniques": ["fake-ops", "heap-spray", "kaslr-bypass", "setxattr-spray", "user_key_payload-spray"],
+    },
+    "CVE-2023-31436_mitigation": {
+        "bug_classes": ["oob"],
+        "techniques": ["fake-ops", "heap-spray", "kaslr-bypass", "rop"],
+    },
+    "CVE-2023-32233_mitigation": {
+        "bug_classes": ["uaf"],
+        "techniques": ["fake-ops", "heap-spray", "kaslr-bypass", "rop"],
+    },
+    "CVE-2023-3390_lts_cos_mitigation": {
+        "bug_classes": ["uaf"],
+        "techniques": ["cross-cache", "heap-spray", "kaslr-bypass", "msg_msg-spray", "rop",
+                       "setxattr-spray", "user_key_payload-spray"],
+    },
+    "CVE-2023-3609_cos_mitigation": {
+        "bug_classes": ["uaf"],
+        "techniques": ["fake-ops", "heap-spray", "kaslr-bypass"],
+    },
+    "CVE-2023-3611_lts_mitigation": {
+        "bug_classes": ["oob"],
+        "techniques": ["fake-ops", "heap-spray", "kaslr-bypass", "rop", "user_key_payload-spray"],
+    },
+    "CVE-2023-3776_cos_mitigation": {
+        "bug_classes": ["uaf"],
+        "techniques": ["fake-ops", "heap-spray", "kaslr-bypass"],
+    },
+    "CVE-2023-3776_lts": {
+        "bug_classes": ["uaf"],
+        "techniques": ["fake-ops", "heap-spray", "kaslr-bypass"],
+    },
+    "CVE-2023-3777_lts": {
+        "bug_classes": ["uaf"],
+        "techniques": ["fake-ops", "heap-spray", "kaslr-bypass", "rop"],
+    },
+    "CVE-2023-4004_lts_cos_mitigation": {
+        "bug_classes": ["uaf"],
+        "techniques": ["fake-ops", "heap-spray", "kaslr-bypass", "msg_msg-spray", "rop"],
+    },
+    "CVE-2023-4015_cos": {
+        "bug_classes": ["uaf"],
+        "techniques": ["cross-cache", "fake-ops", "heap-spray", "kaslr-bypass", "msg_msg-spray", "rop"],
+    },
+    "CVE-2023-4015_lts": {
+        "bug_classes": ["uaf"],
+        "techniques": ["heap-spray", "kaslr-bypass", "msg_msg-spray", "rop"],
+    },
+    "CVE-2023-4015_lts_2": {
+        "bug_classes": ["uaf"],
+        "techniques": [],
+    },
+    "CVE-2023-4147_lts_cos": {
+        "bug_classes": ["uaf"],
+        "techniques": ["heap-spray", "kaslr-bypass", "msg_msg-spray", "rop"],
+    },
+    "CVE-2023-4147_mitigation": {
+        "bug_classes": ["uaf"],
+        "techniques": [],
+    },
+    "CVE-2023-4206_lts_cos": {
+        "bug_classes": ["uaf"],
+        "techniques": ["fake-ops", "heap-spray", "kaslr-bypass"],
+    },
+    "CVE-2023-4206_lts_cos_mitigation_2": {
+        "bug_classes": ["uaf"],
+        "techniques": ["cross-cache", "fake-ops", "heap-spray", "kaslr-bypass", "rop", "setxattr-spray"],
+    },
+    "CVE-2023-4207_lts_cos": {
+        "bug_classes": ["uaf"],
+        "techniques": ["fake-ops", "heap-spray", "kaslr-bypass"],
+    },
+    "CVE-2023-4207_lts_cos_mitigation_2": {
+        "bug_classes": ["uaf"],
+        "techniques": ["cross-cache", "fake-ops", "heap-spray", "kaslr-bypass", "rop", "setxattr-spray"],
+    },
+    "CVE-2023-4208_lts_cos_mitigation": {
+        "bug_classes": ["uaf"],
+        "techniques": ["fake-ops", "heap-spray", "kaslr-bypass"],
+    },
+    "CVE-2023-4208_lts_cos_mitigation_2": {
+        "bug_classes": ["uaf"],
+        "techniques": ["cross-cache", "fake-ops", "heap-spray", "kaslr-bypass", "rop", "setxattr-spray"],
+    },
+    "CVE-2023-4244_lts": {
+        "bug_classes": ["double-free", "uaf"],
+        "techniques": ["cross-cache", "fake-ops", "heap-spray", "kaslr-bypass", "msg_msg-spray", "rop"],
+    },
+    "CVE-2023-4244_mitigation": {
+        "bug_classes": ["race", "uaf"],
+        "techniques": ["fake-ops", "heap-spray", "kaslr-bypass", "page-allocator", "rop"],
+    },
+    "CVE-2023-4569_lts": {
+        "bug_classes": ["double-free", "uaf"],
+        "techniques": [],
+    },
+    "CVE-2023-4622_cos": {
+        "bug_classes": ["race", "uaf"],
+        "techniques": ["cross-cache", "entrybleed", "heap-spray", "kaslr-bypass",
+                       "msg_msg-spray", "pipe_buffer-spray", "race-exploit", "rop"],
+    },
+    "CVE-2023-4622_lts": {
+        "bug_classes": ["race", "uaf"],
+        "techniques": ["cross-cache", "entrybleed", "heap-spray", "kaslr-bypass",
+                       "msg_msg-spray", "pipe_buffer-spray", "race-exploit", "rop"],
+    },
+    "CVE-2023-4623_lts_cos": {
+        "bug_classes": ["uaf"],
+        "techniques": ["fake-ops", "kaslr-bypass", "rop", "setxattr-spray"],
+    },
+    "CVE-2023-4921_lts_cos_mitigation": {
+        "bug_classes": ["uaf"],
+        "techniques": ["fake-ops", "heap-spray", "kaslr-bypass", "rop",
+                       "setxattr-spray", "user_key_payload-spray"],
+    },
+    "CVE-2023-5197_lts_cos": {
+        "bug_classes": ["uaf"],
+        "techniques": ["heap-spray", "kaslr-bypass", "msg_msg-spray", "rop"],
+    },
+    "CVE-2023-5197_mitigation": {
+        "bug_classes": ["uaf"],
+        "techniques": ["fake-ops", "heap-spray", "kaslr-bypass", "page-allocator", "rop"],
+    },
+    "CVE-2023-52447_cos": {
+        "bug_classes": ["uaf"],
+        "techniques": ["cross-cache", "heap-spray", "kaslr-bypass", "pipe_buffer-spray", "race-exploit"],
+    },
+    "CVE-2023-52620_lts_cos_mitigation": {
+        "bug_classes": ["uaf"],
+        "techniques": ["fake-ops", "heap-spray", "kaslr-bypass", "page-allocator", "rop"],
+    },
+    "CVE-2023-52924_mitigation": {
+        "bug_classes": ["uaf"],
+        "techniques": ["fake-ops", "heap-spray", "kaslr-bypass", "page-allocator", "rop"],
+    },
+    "CVE-2023-52925_mitigation": {
+        "bug_classes": ["uaf"],
+        "techniques": ["fake-ops", "heap-spray", "kaslr-bypass", "page-allocator", "rop"],
+    },
+    "CVE-2023-52927_cos": {
+        "bug_classes": ["uaf"],
+        "techniques": ["cross-cache", "fake-ops", "heap-spray", "kaslr-bypass", "rop"],
+    },
+    "CVE-2023-5345_lts_mitigation": {
+        "bug_classes": ["double-free"],
+        "techniques": ["heap-spray", "kaslr-bypass", "rop", "setxattr-spray", "user_key_payload-spray"],
+    },
+    "CVE-2023-6111_cos": {
+        "bug_classes": ["uaf"],
+        "techniques": ["fake-ops", "heap-spray", "kaslr-bypass", "rop"],
+    },
+    "CVE-2023-6111_lts": {
+        "bug_classes": ["uaf"],
+        "techniques": ["fake-ops", "heap-spray", "kaslr-bypass", "rop"],
+    },
+    "CVE-2023-6560_mitigation": {
+        "bug_classes": ["oob"],
+        "techniques": ["cross-cache", "kaslr-bypass", "page-allocator"],
+    },
+    "CVE-2023-6817_lts_cos": {
+        "bug_classes": ["uaf"],
+        "techniques": [],           # only a minimal PoC that triggers the bug
+    },
+    "CVE-2023-6817_mitigation": {
+        "bug_classes": ["uaf"],
+        "techniques": ["fake-ops", "heap-spray", "kaslr-bypass", "rop"],
+    },
+    "CVE-2023-6931_lts_cos": {
+        "bug_classes": ["integer-overflow", "oob"],
+        "techniques": ["fake-ops", "heap-spray", "kaslr-bypass", "rop", "setxattr-spray"],
+    },
+    "CVE-2023-6931_mitigation": {
+        "bug_classes": ["integer-overflow", "oob"],
+        "techniques": ["fake-ops", "heap-spray", "kaslr-bypass", "page-allocator",
+                       "pipe_buffer-spray", "rop", "setxattr-spray", "user_key_payload-spray"],
+    },
+    "CVE-2023-6932_cos": {
+        "bug_classes": ["race", "uaf"],
+        "techniques": ["kaslr-bypass", "race-exploit", "rop", "user_key_payload-spray"],
+    },
+    "CVE-2024-0193_cos": {
+        "bug_classes": ["uaf"],
+        "techniques": ["heap-spray", "kaslr-bypass", "msg_msg-spray", "rop"],
+    },
+    "CVE-2024-0193_lts": {
+        "bug_classes": ["uaf"],
+        "techniques": ["heap-spray", "kaslr-bypass", "msg_msg-spray", "rop"],
+    },
+    "CVE-2024-0193_mitigation": {
+        "bug_classes": ["uaf"],
+        "techniques": ["fake-ops", "heap-spray", "kaslr-bypass", "page-allocator", "rop"],
+    },
+    "CVE-2024-0582_mitigation": {
+        "bug_classes": ["uaf"],
+        "techniques": ["cross-cache", "kaslr-bypass", "page-allocator"],
+    },
+    "CVE-2024-1085_cos": {
+        "bug_classes": ["double-free"],
+        "techniques": [],           # only a trigger PoC
+    },
+    "CVE-2024-1085_lts": {
+        "bug_classes": ["double-free"],
+        "techniques": [],           # only a trigger PoC
+    },
+    "CVE-2024-1086_lts_mitigation": {
+        "bug_classes": ["double-free"],
+        "techniques": ["kaslr-bypass", "page-allocator", "race-exploit"],
+    },
+    "CVE-2024-26581_lts_cos_mitigation": {
+        "bug_classes": ["uaf"],
+        "techniques": [],           # only a trigger PoC
+    },
+    "CVE-2024-26582_mitigation": {
+        "bug_classes": ["uaf"],
+        "techniques": ["kaslr-bypass", "rop"],
+    },
+    "CVE-2024-26585_lts_cos": {
+        "bug_classes": ["race", "uaf"],
+        "techniques": ["heap-spray", "kaslr-bypass", "race-exploit", "rop", "user_key_payload-spray"],
+    },
+    "CVE-2024-26642_cos": {
+        "bug_classes": ["uaf"],
+        "techniques": [],           # only a trigger PoC
+    },
+    "CVE-2024-26642_lts": {
+        "bug_classes": ["uaf"],
+        "techniques": [],           # only a trigger PoC
+    },
+    "CVE-2024-26642_mitigation": {
+        "bug_classes": ["uaf"],
+        "techniques": ["fake-ops", "kaslr-bypass", "rop"],
+    },
+    "CVE-2024-26808_cos": {
+        "bug_classes": ["uaf"],
+        "techniques": ["cross-cache", "kaslr-bypass", "msg_msg-spray", "pipe_buffer-spray"],
+    },
+    "CVE-2024-26809_lts_cos": {
+        "bug_classes": ["double-free"],
+        "techniques": ["fake-ops", "heap-spray", "kaslr-bypass", "rop"],
+    },
+    "CVE-2024-26925_lts_cos": {
+        "bug_classes": ["double-free", "race"],
+        "techniques": ["cross-cache", "fake-ops", "heap-spray", "kaslr-bypass",
+                       "msg_msg-spray", "race-exploit", "rop"],
+    },
+    "CVE-2024-27397_mitigation": {
+        "bug_classes": ["uaf"],
+        "techniques": ["fake-ops", "heap-spray", "kaslr-bypass", "rop"],
+    },
+    "CVE-2024-36972_lts_cos": {
+        "bug_classes": ["double-free", "race"],
+        "techniques": ["cross-cache", "fake-ops", "kaslr-bypass", "msg_msg-spray",
+                       "race-exploit", "rop"],
+    },
+    "CVE-2024-39503_lts_cos": {
+        "bug_classes": ["race", "uaf"],
+        "techniques": ["heap-spray", "kaslr-bypass", "race-exploit", "user_key_payload-spray"],
+    },
+    "CVE-2024-41009_lts_cos": {
+        "bug_classes": ["buffer-overlap"],
+        "techniques": ["cross-cache", "heap-spray", "kaslr-bypass", "pipe_buffer-spray", "rop"],
+    },
+    "CVE-2024-41010_lts": {
+        "bug_classes": ["uaf"],
+        "techniques": ["cross-cache", "heap-spray", "kaslr-bypass", "msg_msg-spray",
+                       "pipe_buffer-spray", "rop"],
+    },
+    "CVE-2024-49861_lts": {
+        "bug_classes": ["missing-check"],
+        "techniques": ["fake-ops", "kaslr-bypass", "rop"],
+    },
+    "CVE-2024-53125_lts": {
+        "bug_classes": ["missing-check"],
+        "techniques": ["fake-ops", "kaslr-bypass", "rop"],
+    },
+    "CVE-2024-53141_cos_mitigation": {
+        "bug_classes": ["missing-check", "oob"],
+        "techniques": ["cross-cache", "heap-spray", "kaslr-bypass", "msg_msg-spray",
+                       "pipe_buffer-spray", "rop"],
+    },
+    "CVE-2024-53141_lts": {
+        "bug_classes": ["missing-check", "oob"],
+        "techniques": ["cross-cache", "heap-spray", "kaslr-bypass", "msg_msg-spray",
+                       "pipe_buffer-spray", "rop"],
+    },
+    "CVE-2024-53164_lts_cos_mitigation": {
+        "bug_classes": ["uaf"],
+        "techniques": ["fake-ops", "heap-spray", "kaslr-bypass", "rop"],
+    },
+    "CVE-2024-57947_mitigation": {
+        "bug_classes": ["uaf"],
+        "techniques": ["fake-ops", "heap-spray", "kaslr-bypass", "page-allocator", "rop"],
+    },
+    "CVE-2024-58240_cos": {
+        "bug_classes": ["race", "uaf"],
+        "techniques": ["kaslr-bypass", "race-exploit", "rop", "user_key_payload-spray"],
+    },
+    "CVE-2025-21700_lts_cos_mitigation": {
+        "bug_classes": ["uaf"],
+        "techniques": ["fake-ops", "heap-spray", "kaslr-bypass", "rop"],
+    },
+    "CVE-2025-21701_lts_cos": {
+        "bug_classes": ["race", "uaf"],
+        "techniques": ["fake-ops", "kaslr-bypass", "msg_msg-spray", "race-exploit", "rop"],
+    },
+    "CVE-2025-21702_lts_cos": {
+        "bug_classes": ["missing-check", "uaf"],
+        "techniques": ["fake-ops", "heap-spray", "kaslr-bypass", "rop", "user_key_payload-spray"],
+    },
+    "CVE-2025-21756_cos": {
+        "bug_classes": ["uaf"],
+        "techniques": ["cross-cache", "entrybleed", "heap-spray", "kaslr-bypass",
+                       "msg_msg-spray", "rop"],
+    },
+    "CVE-2025-21836_lts": {
+        "bug_classes": ["race", "uaf"],
+        "techniques": ["entrybleed", "heap-spray", "kaslr-bypass", "msg_msg-spray",
+                       "race-exploit", "rop"],
+    },
+    "CVE-2025-37752_cos": {
+        "bug_classes": ["oob"],
+        "techniques": ["heap-spray", "page-allocator", "pipe_buffer-spray"],
+    },
+    "CVE-2025-38001_lts_cos_mitigation": {
+        "bug_classes": ["uaf"],
+        "techniques": ["heap-spray", "page-allocator", "pipe_buffer-spray"],
+    },
+    "CVE-2025-38083_cos_mitigation": {
+        "bug_classes": ["race", "uaf"],
+        "techniques": ["fake-ops", "heap-spray", "kaslr-bypass", "pipe_buffer-spray",
+                       "race-exploit", "rop", "user_key_payload-spray"],
+    },
+    "CVE-2025-40364_lts_cos": {
+        "bug_classes": ["uaf"],
+        "techniques": ["cross-cache", "heap-spray", "kaslr-bypass", "msg_msg-spray"],
+    },
+}
+
+
+
+# ---------------------------------------------------------------------------
 # Main backfill logic
 # ---------------------------------------------------------------------------
 
 def _read(path: str) -> str:
+    """Return file contents, or empty string when the file does not exist."""
     try:
         with open(path) as f:
             return f.read()
-    except OSError:
+    except FileNotFoundError:
+        return ""
+    except OSError as exc:
+        print(f"[!] Warning: could not read {path}: {exc}", file=sys.stderr)
         return ""
 
 
 def backfill(metadata_file: str) -> bool:
     """Re-derive analysis fields for one metadata.json.  Return True if changed."""
     submission_path = os.path.dirname(metadata_file)
+    submission_name = os.path.basename(submission_path)
     docs_dir = os.path.join(submission_path, "docs")
     exploit_dir = os.path.join(submission_path, "exploit")
 
     with open(metadata_file) as f:
         metadata = json.load(f)
 
-    vuln_text = _read(os.path.join(docs_dir, "vulnerability.md"))
-    exploit_text = _read(os.path.join(docs_dir, "exploit.md"))
+    # Prefer manually-derived values (from reading the docs); fall back to
+    # document parsing for submissions not yet in the manual table.
+    manual = _MANUAL_DATA.get(submission_name)
+
+    if manual:
+        bug_classes = sorted(manual["bug_classes"])
+        techniques  = sorted(manual["techniques"])
+    else:
+        vuln_text   = _read(os.path.join(docs_dir, "vulnerability.md"))
+        exploit_text = _read(os.path.join(docs_dir, "exploit.md"))
+        bug_classes = _parse_bug_classes(vuln_text)
+        techniques  = _parse_techniques(exploit_text)
 
     # --- vulnerability.bug_classes -------------------------------------------
     vuln = metadata.setdefault("vulnerability", {})
-    bug_classes = _parse_bug_classes(vuln_text)
     changed = False
 
     if vuln.get("bug_classes") != bug_classes:
@@ -307,8 +697,6 @@ def backfill(metadata_file: str) -> bool:
         changed = True
 
     # --- per-exploit techniques + syscalls_used ------------------------------
-    techniques = _parse_techniques(exploit_text)
-
     exploits_raw = metadata.get("exploits", {})
     is_list = isinstance(exploits_raw, list)
     entries = exploits_raw if is_list else list(exploits_raw.items())
