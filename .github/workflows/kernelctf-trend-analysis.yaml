@@ -1,0 +1,68 @@
+name: kernelCTF trend analysis
+on:
+  push:
+    branches: [master]
+    paths: ['pocs/linux/kernelctf/**/metadata.json']
+  schedule:
+    - cron: '0 9 * * 1'  # Every Monday at 09:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run trend analysis
+        id: analysis
+        run: |
+          set +e
+          python3 kernelctf/analyze_trends.py > /tmp/trend_report.md 2>/tmp/analysis_stderr.txt
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          cat /tmp/analysis_stderr.txt >&2
+          cat /tmp/trend_report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Notify product teams (create or update tracking issue)
+        if: steps.analysis.outputs.exit_code == '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TITLE="kernelCTF subsystem hotspots: attack surface reduction needed"
+          LABEL="kernelctf-trend"
+
+          # Create the label if it does not exist yet.
+          gh label create "$LABEL" \
+            --description "kernelCTF subsystem hotspot tracking" \
+            --color "e4e669" \
+            --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
+
+          # Check whether an open tracking issue already exists.
+          EXISTING=$(gh issue list \
+            --label "$LABEL" \
+            --state open \
+            --json number \
+            --jq '.[0].number' \
+            --repo "$GITHUB_REPOSITORY")
+
+          BODY=$(cat /tmp/trend_report.md)
+
+          if [ -n "$EXISTING" ]; then
+            # Update the body of the existing issue with the latest report.
+            gh issue edit "$EXISTING" \
+              --body "$BODY" \
+              --repo "$GITHUB_REPOSITORY"
+            echo "[+] Updated existing tracking issue #$EXISTING"
+          else
+            # Open a new tracking issue for product team review.
+            gh issue create \
+              --title "$TITLE" \
+              --body "$BODY" \
+              --label "$LABEL" \
+              --repo "$GITHUB_REPOSITORY"
+            echo "[+] Created new tracking issue"
+          fi
