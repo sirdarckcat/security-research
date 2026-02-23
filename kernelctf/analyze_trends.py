@@ -1,9 +1,13 @@
 #!/usr/bin/env -S python3 -u
 """Analyze kernelCTF submission trends and identify subsystem hotspots.
 
-Reads all metadata.json files from pocs/linux/kernelctf/ together with the
-accompanying docs/vulnerability.md, docs/exploit.md and exploit source files
-to produce a rich trend report covering:
+Reads all metadata.json files from pocs/linux/kernelctf/.  Structured fields
+added to metadata.json (bug_classes, techniques, syscalls_used) are read
+directly; for older files without those fields the tool falls back to
+heuristic extraction from docs/vulnerability.md, docs/exploit.md and exploit
+C source files.
+
+Report sections:
   - Subsystems targeted by three or more unique CVEs (hotspots)
   - Bug-cause taxonomy (UAF, OOB, race condition, …)
   - Exploit techniques (cross-cache, heap spray, ROP, KASLR bypass, …)
@@ -298,21 +302,46 @@ def load_submissions(poc_folder):
         capabilities = reqs.get("capabilities", [])
         subsystems = classify_subsystems(kernel_configs)
 
-        # --- Read docs and source ----------------------------------------
-        vuln_text, exploit_text, source_text = _read_docs_and_source(submission_path)
-        combined_docs = vuln_text + "\n" + exploit_text
-
-        bug_causes = _extract_bug_causes(vuln_text or combined_docs)
-        syscalls_to_disable = _extract_syscall_to_disable(vuln_text)
-        techniques = _extract_techniques(combined_docs)
-        heap_caches = _extract_heap_caches(combined_docs)
-        source_syscalls = _extract_source_syscalls(source_text)
-
-        # --- Parse stability and KASLR flag from all exploit entries -----
+        # --- Structured fields from metadata.json (preferred) ---------------
+        bug_causes = set(vuln.get("bug_classes") or [])
         exploits_raw = metadata.get("exploits", {})
         exploit_entries = (
-            exploits_raw if isinstance(exploits_raw, list) else exploits_raw.values()
+            exploits_raw if isinstance(exploits_raw, list) else list(exploits_raw.values())
         )
+        # Aggregate per-exploit techniques / syscalls across all variants.
+        techniques_from_meta: set = set()
+        source_syscalls_from_meta: set = set()
+        for entry in exploit_entries:
+            techniques_from_meta.update(entry.get("techniques") or [])
+            source_syscalls_from_meta.update(entry.get("syscalls_used") or [])
+
+        # --- Fallback: parse docs / source when structured fields absent ----
+        needs_docs = (
+            not bug_causes
+            or not techniques_from_meta
+            or not source_syscalls_from_meta
+        )
+        vuln_text = exploit_text = source_text = ""
+        if needs_docs:
+            vuln_text, exploit_text, source_text = _read_docs_and_source(submission_path)
+        combined_docs = vuln_text + "\n" + exploit_text
+
+        if not bug_causes:
+            bug_causes = _extract_bug_causes(vuln_text or combined_docs)
+        if not techniques_from_meta:
+            techniques_from_meta = _extract_techniques(combined_docs)
+        if not source_syscalls_from_meta:
+            source_syscalls_from_meta = _extract_source_syscalls(source_text)
+
+        # syscalls_to_disable and heap_caches are always read from docs
+        # (they have no structured field in metadata.json yet).
+        if not vuln_text and not exploit_text:
+            vuln_text, exploit_text, _ = _read_docs_and_source(submission_path)
+        combined_docs = vuln_text + "\n" + exploit_text
+        syscalls_to_disable = _extract_syscall_to_disable(vuln_text)
+        heap_caches = _extract_heap_caches(combined_docs)
+
+        # --- Parse stability and KASLR flag from all exploit entries --------
         stabilities = []
         kaslr_separate = False
         for entry in exploit_entries:
@@ -340,12 +369,11 @@ def load_submissions(poc_folder):
             "attack_surface": attack_surface,
             "capabilities": capabilities,
             "subsystems": subsystems,
-            # enriched from docs / source
             "bug_causes": bug_causes,
             "syscalls_to_disable": syscalls_to_disable,
-            "techniques": techniques,
+            "techniques": techniques_from_meta,
             "heap_caches": heap_caches,
-            "source_syscalls": source_syscalls,
+            "source_syscalls": source_syscalls_from_meta,
             "avg_stability": avg_stability,
             "kaslr_separate": kaslr_separate,
         })
@@ -509,7 +537,8 @@ def generate_report(stats):
         lines += [
             "## Bug-Cause Distribution",
             "",
-            "Derived from `vulnerability.md` descriptions across all submissions. "
+            "From `vulnerability.bug_classes` in `metadata.json` "
+            "(falling back to heuristic doc parsing for older submissions). "
             "A single submission may exhibit multiple causes.",
             "",
             "| Bug Cause | Submissions |",
@@ -524,7 +553,8 @@ def generate_report(stats):
         lines += [
             "## Exploit Technique Trends",
             "",
-            "Techniques detected in `exploit.md` documentation. "
+            "From `techniques` in each `exploits.<target>` entry of `metadata.json` "
+            "(falling back to heuristic doc parsing for older submissions). "
             "Recurring techniques across many CVEs are prime targets for "
             "generic mitigations (e.g., hardening heap object layouts, "
             "restricting cross-cache reuse).",
@@ -560,12 +590,13 @@ def generate_report(stats):
         lines += [
             "## Syscalls Used in Exploit Code",
             "",
-            "Syscalls detected in `exploit.c` / `poc.c` source files. "
+            "From `syscalls_used` in each `exploits.<target>` entry of `metadata.json` "
+            "(falling back to heuristic C source scanning for older submissions). "
             "These are the building blocks of the exploits and potential "
             "seccomp / LSM restriction points.",
             "",
-            "| Syscall | Exploit files |",
-            "|---------|---------------|",
+            "| Syscall | Exploit variants |",
+            "|---------|-----------------|",
         ]
         for sc, count in sorted(stats["source_syscall_counts"].items(), key=lambda x: -x[1]):
             lines.append(f"| `{sc}` | {count} |")
