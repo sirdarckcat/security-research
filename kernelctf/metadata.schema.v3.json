@@ -71,6 +71,23 @@
                         }
                     }
                 },
+                "bug_classes": {
+                    "type": "array",
+                    "description": "Vulnerability bug class(es). Helps identify recurring vulnerability patterns across submissions.",
+                    "uniqueItems": true,
+                    "items": {
+                        "enum": [
+                            "uaf",
+                            "double-free",
+                            "oob",
+                            "race",
+                            "integer-overflow",
+                            "buffer-overlap",
+                            "refcount-overflow",
+                            "missing-check"
+                        ]
+                    }
+                },
                 "syzkaller_reference": {
                     "pattern": "^https://syzkaller.appspot.com/"
                 }
@@ -96,6 +113,34 @@
                         "stability_notes": {
                             "type": "string",
                             "description": "Notes on the stability of the exploit. How percentage the exploit can get the flag or how many times needs to be run on average to get the flag (e.g. 90%, 50%, or needs to be run 10 times to get the flag once)."
+                        },
+                        "techniques": {
+                            "type": "array",
+                            "description": "Exploit technique(s) used. Helps identify recurring exploitation patterns across submissions.",
+                            "uniqueItems": true,
+                            "items": {
+                                "enum": [
+                                    "heap-spray",
+                                    "cross-cache",
+                                    "rop",
+                                    "kaslr-bypass",
+                                    "fake-ops",
+                                    "msg_msg-spray",
+                                    "pipe_buffer-spray",
+                                    "user_key_payload-spray",
+                                    "page-allocator",
+                                    "race-exploit",
+                                    "entrybleed",
+                                    "userfaultfd",
+                                    "setxattr-spray"
+                                ]
+                            }
+                        },
+                        "syscalls_used": {
+                            "type": "array",
+                            "description": "Syscalls called by the exploit, as potential seccomp / LSM restriction points.",
+                            "uniqueItems": true,
+                            "items": { "type": "string" }
                         }
                     }
                 }
